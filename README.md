@@ -78,13 +78,15 @@ That covers every segment above except two, each of which needs a hook to feed i
 
 The cost cluster answers "what is this session costing me, and how much have I spent today?" in one place. Session cost and the per-hour burn rate come directly from Claude Code's stdin JSON; today's total is computed the way [ccusage](https://ccusage.com/guide/statusline) does it.
 
-Claude Code transcripts record `costUSD: null` on every line, so **today's total is derived, not read**: claude-healthline sums today's token `usage` across `~/.claude/projects/**/*.jsonl` and multiplies by a per-model price table. Prices are per-million tokens (August 2026); cache rates follow Anthropic's published ratios — cache read `0.10×` input, 5-minute cache write `1.25×`, 1-hour cache write `2.0×`.
+Claude Code transcripts record `costUSD: null` on every line, so **today's total is derived, not read**: claude-healthline sums today's token `usage` across `~/.claude/projects/**/*.jsonl` — subagent and workflow transcripts included — and multiplies by a per-model price table. Claude Code writes one line per content block of a response, each repeating the full `usage`, so lines are de-duplicated on message and request id before pricing.
 
-**Override the built-in prices without recompiling** by creating `~/.claude/healthline-pricing.json`:
+Prices are per-million tokens (November 2026). Cache writes cost `1.25×` input (5-minute) or `2.0×` (1-hour); cache reads vary by model (`0.10×` input on most, `0.05×` on Opus 5.5, `0.025×` on Fable 5.1). Haiku 5.5 prompts over 100K tokens are billed at its long-prompt rates.
+
+**Override the built-in prices without recompiling** by creating `~/.claude/healthline-pricing.json`. `cache_read` is optional and defaults to a tenth of `input`:
 
 ```json
 {
-  "claude-opus-4-8":   { "input": 5.0, "output": 25.0 },
+  "claude-opus-4-8":   { "input": 5.0, "output": 25.0, "cache_read": 0.5 },
   "claude-sonnet-4-6": { "input": 3.0, "output": 15.0 }
 }
 ```
@@ -277,7 +279,7 @@ claude-healthline optimizes for a lean, native, never-blank single binary with b
 Yes. Set `CLAUDE_HEALTHLINE_ASCII=1` (or `NERD_FONT=0`) and it renders plain-text labels (`model`, `ctx`, `cost`, …) with colors intact. The powerline glyphs need a [Nerd Font](https://www.nerdfonts.com/) such as *MesloLGS NF*; without one they show as boxes, which is why the ASCII fallback exists.
 
 ### How does it calculate today's cost?
-It sums today's token usage from your Claude Code transcripts (`~/.claude/projects/**/*.jsonl`) and applies a per-model price table, because transcripts store `costUSD: null`. Cache tokens are priced at Anthropic's ratios (read `0.10×`, write `1.25×`/`2.0×`). Disable the scan with `CLAUDE_HEALTHLINE_NO_DAILY=1`.
+It sums today's token usage from your Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, subagents included), counts each response once, and applies a per-model price table, because transcripts store `costUSD: null`. Cache writes are priced at `1.25×`/`2.0×` input and cache reads at each model's own rate. Disable the scan with `CLAUDE_HEALTHLINE_NO_DAILY=1`.
 
 ### Will it slow down Claude Code?
 No. Warm renders are single-digit milliseconds; the only external call (`cn`) is capped at 800 ms and cached, and the daily scan is cached for 60 seconds. There are no `git`/`jq`/shell subprocesses on the hot path.
@@ -309,7 +311,7 @@ No. The task segment simply disappears if `cn` (chronis) or an in-progress task 
 It still prints a valid one-line status and exits `0`. A missing or null field omits only its own segment; garbage input falls back to the model name. This is a design guarantee, not a best effort.
 
 ### Is the pricing table going to go stale?
-The built-in prices are a snapshot (August 2026). When Anthropic changes prices, edit the table or drop a `~/.claude/healthline-pricing.json` override — no recompile needed.
+The built-in prices are a snapshot (November 2026). When Anthropic changes prices, edit the table or drop a `~/.claude/healthline-pricing.json` override — no recompile needed.
 
 ### Do I have to drop caveman's badge script to use this?
 No — this renders it. Point `statusLine.command` at claude-healthline and the caveman level plus its savings figure appear as a segment, read from the same files the plugin already writes. Nothing to install, nothing to wrap, and `CLAUDE_HEALTHLINE_NO_CAVEMAN=1` turns it off. See [Caveman mode](#caveman-mode).

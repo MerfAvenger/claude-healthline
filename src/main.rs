@@ -6,6 +6,7 @@
 //! Hard contract: never panic on external input, always print at least one
 //! non-empty line, always exit 0. A missing/null field just omits its segment.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -495,55 +496,107 @@ fn read_cache(path: &Path) -> Option<String> {
 //
 // Claude Code transcripts store `costUSD: null` per line, so today's cost is
 // derived from token usage x per-model pricing. Prices are per MILLION tokens
-// (Aug 2026); cache rates follow Anthropic's ratios (read = 0.10x input,
-// 5-min write = 1.25x input, 1-hour write = 2.0x input). Override the built-in
-// table with ~/.claude/healthline-pricing.json:
-//   { "claude-opus-4-8": { "input": 5.0, "output": 25.0 }, ... }
+// (Nov 2026). Cache writes cost 1.25x input (5-min) or 2.0x input (1-hour);
+// cache reads vary by model, so every row carries its own read rate. Override
+// the built-in table with ~/.claude/healthline-pricing.json:
+//   { "claude-opus-4-8": { "input": 5.0, "output": 25.0, "cache_read": 0.5 } }
 // ---------------------------------------------------------------------------
 
 const DAILY_TTL_SECS: u64 = 60;
 
-#[derive(Clone, Copy)]
-struct Price {
+const DEFAULT_CACHE_READ_RATIO: f64 = 0.10;
+
+/// Directories walked below ~/.claude/projects. The deepest transcripts today
+/// sit five down: `<project>/<session>/subagents/workflows/<run>/agent-*.jsonl`.
+const TRANSCRIPT_MAX_DEPTH: usize = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rates {
     input_per_m: f64,
     output_per_m: f64,
+    cache_read_per_m: f64,
 }
 
-fn builtin_price(model: &str) -> Option<Price> {
-    let m = model.to_ascii_lowercase();
-    let p = |i, o| Price {
-        input_per_m: i,
-        output_per_m: o,
-    };
-    if m.contains("opus") {
-        Some(p(5.0, 25.0)) // Opus 4.6/4.7/4.8, Opus 5
-    } else if m.contains("sonnet-5") || m.contains("sonnet5") {
-        Some(p(2.0, 10.0))
-    } else if m.contains("sonnet") {
-        Some(p(3.0, 15.0)) // Sonnet 4.6
-    } else if m.contains("haiku") {
-        Some(p(1.0, 5.0))
-    } else if m.contains("fable") {
-        Some(p(10.0, 50.0))
-    } else {
-        None
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Price {
+    base: Rates,
+    /// `(prompt_tokens, rates)`: a request whose whole prompt, cache included,
+    /// exceeds the threshold is billed entirely at the long-prompt rates.
+    long_prompt: Option<(f64, Rates)>,
+}
+
+impl Price {
+    fn rates_for_prompt(&self, prompt_tokens: f64) -> Rates {
+        match self.long_prompt {
+            Some((threshold, long_rates)) if prompt_tokens > threshold => long_rates,
+            _ => self.base,
+        }
     }
+}
+
+const fn rates(input_per_m: f64, output_per_m: f64, cache_read_per_m: f64) -> Rates {
+    Rates {
+        input_per_m,
+        output_per_m,
+        cache_read_per_m,
+    }
+}
+
+const fn flat(input_per_m: f64, output_per_m: f64, cache_read_per_m: f64) -> Price {
+    Price {
+        base: rates(input_per_m, output_per_m, cache_read_per_m),
+        long_prompt: None,
+    }
+}
+
+// Haiku 5.5's cache-read rate is unpublished; 0.1x input is assumed.
+const HAIKU_5_5: Price = Price {
+    base: rates(0.10, 0.50, 0.01),
+    long_prompt: Some((100_000.0, rates(0.50, 2.50, 0.05))),
+};
+
+// First substring match wins, so a specific id must sit above its family's
+// catch-all (`opus-5-5` above `opus`).
+const BUILTIN_PRICES: &[(&str, Price)] = &[
+    ("fable-5-1", flat(10.0, 50.0, 0.25)),
+    ("mythos-5-1", flat(10.0, 50.0, 0.25)),
+    ("fable", flat(10.0, 50.0, 1.00)),
+    ("opus-5-5", flat(4.0, 20.0, 0.20)),
+    ("opus", flat(5.0, 25.0, 0.50)),
+    ("sonnet-5", flat(2.0, 10.0, 0.20)),
+    ("sonnet", flat(3.0, 15.0, 0.30)),
+    ("haiku-5-5", HAIKU_5_5),
+    ("haiku", flat(1.0, 5.0, 0.10)),
+];
+
+fn builtin_price(model: &str) -> Option<Price> {
+    let model = model.to_ascii_lowercase();
+
+    BUILTIN_PRICES
+        .iter()
+        .find(|(needle, _)| model.contains(needle))
+        .map(|(_, price)| *price)
+}
+
+fn override_price(entry: &Value) -> Option<Price> {
+    let input_per_m = entry.get("input")?.as_f64()?;
+    let output_per_m = entry.get("output")?.as_f64()?;
+
+    let cache_read_per_m = entry
+        .get("cache_read")
+        .and_then(Value::as_f64)
+        .unwrap_or(input_per_m * DEFAULT_CACHE_READ_RATIO);
+
+    Some(flat(input_per_m, output_per_m, cache_read_per_m))
 }
 
 fn price_for(model: &str, overrides: &Option<Value>) -> Option<Price> {
-    if let Some(map) = overrides {
-        if let Some(e) = map.get(model) {
-            let i = e.get("input").and_then(|v| v.as_f64());
-            let o = e.get("output").and_then(|v| v.as_f64());
-            if let (Some(input_per_m), Some(output_per_m)) = (i, o) {
-                return Some(Price {
-                    input_per_m,
-                    output_per_m,
-                });
-            }
-        }
-    }
-    builtin_price(model)
+    let overridden = overrides
+        .as_ref()
+        .and_then(|map| map.get(model))
+        .and_then(override_price);
+
+    overridden.or_else(|| builtin_price(model))
 }
 
 fn load_price_overrides() -> Option<Value> {
@@ -571,11 +624,17 @@ fn line_cost(usage: &Value, price: Price) -> f64 {
         ),
         None => (n("cache_creation_input_tokens"), 0.0),
     };
-    let in_t = price.input_per_m / 1_000_000.0;
-    let out_t = price.output_per_m / 1_000_000.0;
+
+    let prompt_tokens = input + cache_read + write_5m + write_1h;
+    let rates = price.rates_for_prompt(prompt_tokens);
+
+    let in_t = rates.input_per_m / 1_000_000.0;
+    let out_t = rates.output_per_m / 1_000_000.0;
+    let read_t = rates.cache_read_per_m / 1_000_000.0;
+
     input * in_t
         + output * out_t
-        + cache_read * (0.10 * in_t)
+        + cache_read * read_t
         + write_5m * (1.25 * in_t)
         + write_1h * (2.0 * in_t)
 }
@@ -606,78 +665,147 @@ fn today_utc() -> String {
     utc_ymd(secs)
 }
 
-/// Sum today's (UTC) cost across every project transcript under
-/// ~/.claude/projects/**/*.jsonl. Only files modified in the last ~26h are
-/// scanned; lines are pre-filtered before JSON parse. `None` if disabled, no
-/// HOME, or nothing could be priced.
+/// Sum today's (UTC) cost across every transcript under ~/.claude/projects,
+/// subagent and workflow transcripts included. Only files modified in the last
+/// ~26h are scanned. `None` if no HOME, or nothing could be priced.
 fn daily_cost_uncached(today: &str) -> Option<f64> {
     let home = std::env::var("HOME").ok()?;
     let projects = Path::new(&home).join(".claude/projects");
     let overrides = load_price_overrides();
     let cutoff = SystemTime::now().checked_sub(Duration::from_secs(26 * 3600));
 
+    sum_transcript_costs(&projects, today, &overrides, cutoff)
+}
+
+fn sum_transcript_costs(
+    projects: &Path,
+    today: &str,
+    overrides: &Option<Value>,
+    cutoff: Option<SystemTime>,
+) -> Option<f64> {
+    let mut transcripts = Vec::new();
+    collect_recent_transcripts(projects, 0, cutoff, &mut transcripts);
+
+    let mut seen = HashSet::new();
     let mut total = 0.0;
     let mut priced_any = false;
 
-    for dir in std::fs::read_dir(&projects).ok()?.flatten() {
-        let files = match std::fs::read_dir(dir.path()) {
-            Ok(f) => f,
-            Err(_) => continue,
+    for path in transcripts {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
         };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            // Skip files not touched recently — they hold no today-lines.
-            if let (Some(cut), Ok(meta)) = (cutoff, file.metadata()) {
-                if let Ok(mtime) = meta.modified() {
-                    if mtime < cut {
-                        continue;
-                    }
-                }
-            }
-            let f = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                // Cheap pre-filter before the JSON parse.
-                if !line.contains("\"usage\"") || !line.contains(today) {
-                    continue;
-                }
-                let v: Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-                if !ts.starts_with(today) {
-                    continue;
-                }
-                let usage = match v
-                    .get("usage")
-                    .or_else(|| v.get("message").and_then(|m| m.get("usage")))
-                {
-                    Some(u) => u,
-                    None => continue,
-                };
-                let model = v
-                    .get("model")
-                    .or_else(|| v.get("message").and_then(|m| m.get("model")))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("");
-                if let Some(price) = price_for(model, &overrides) {
-                    total += line_cost(usage, price);
-                    priced_any = true;
-                }
+
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if let Some(cost) = todays_line_cost(&line, today, overrides, &mut seen) {
+                total += cost;
+                priced_any = true;
             }
         }
     }
-    if priced_any {
-        Some(total)
-    } else {
-        None
+
+    priced_any.then_some(total)
+}
+
+fn collect_recent_transcripts(
+    dir: &Path,
+    depth: usize,
+    cutoff: Option<SystemTime>,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            if depth < TRANSCRIPT_MAX_DEPTH {
+                collect_recent_transcripts(&path, depth + 1, cutoff, out);
+            }
+            continue;
+        }
+
+        if is_recent_transcript(&path, &entry, cutoff) {
+            out.push(path);
+        }
     }
+}
+
+fn is_recent_transcript(
+    path: &Path,
+    entry: &std::fs::DirEntry,
+    cutoff: Option<SystemTime>,
+) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return false;
+    }
+
+    let modified = entry.metadata().and_then(|meta| meta.modified());
+
+    match (cutoff, modified) {
+        (Some(cut), Ok(mtime)) => mtime >= cut,
+        _ => true,
+    }
+}
+
+/// Claude Code writes one transcript line per content block of a response,
+/// each repeating the response's full `usage`, so only the first may be priced.
+fn usage_dedupe_key(line: &Value) -> Option<String> {
+    let message_id = line.get("message")?.get("id")?.as_str()?;
+    let request_id = line.get("requestId").and_then(Value::as_str).unwrap_or("");
+
+    Some(format!("{message_id}:{request_id}"))
+}
+
+fn line_usage_and_model(parsed: &Value) -> Option<(&Value, &str)> {
+    let message = parsed.get("message");
+
+    let usage = parsed
+        .get("usage")
+        .or_else(|| message.and_then(|m| m.get("usage")))?;
+    let model = parsed
+        .get("model")
+        .or_else(|| message.and_then(|m| m.get("model")))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    Some((usage, model))
+}
+
+fn todays_line_cost(
+    line: &str,
+    today: &str,
+    overrides: &Option<Value>,
+    seen: &mut HashSet<String>,
+) -> Option<f64> {
+    if !line.contains("\"usage\"") || !line.contains(today) {
+        return None;
+    }
+
+    let parsed: Value = serde_json::from_str(line).ok()?;
+
+    let timestamp = parsed
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !timestamp.starts_with(today) {
+        return None;
+    }
+
+    let (usage, model) = line_usage_and_model(&parsed)?;
+    let price = price_for(model, overrides)?;
+
+    if let Some(key) = usage_dedupe_key(&parsed) {
+        if !seen.insert(key) {
+            return None;
+        }
+    }
+
+    Some(line_cost(usage, price))
 }
 
 /// Cached wrapper: recompute today's cost at most every `DAILY_TTL_SECS`.
@@ -2047,5 +2175,126 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- daily cost ---------------------------------------------------------
+
+    const TODAY: &str = "2026-11-12";
+
+    fn usage_line(message_id: &str, timestamp: &str, model: &str, usage: Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": timestamp,
+            "requestId": format!("req_{message_id}"),
+            "message": { "id": message_id, "model": model, "usage": usage },
+        })
+        .to_string()
+    }
+
+    fn output_only(tokens: u64) -> Value {
+        serde_json::json!({ "input_tokens": 0, "output_tokens": tokens })
+    }
+
+    fn write_transcript(path: &Path, lines: &[String]) {
+        std::fs::create_dir_all(path.parent().expect("transcript parent")).expect("mkdir");
+        std::fs::write(path, lines.join("\n")).expect("write transcript");
+    }
+
+    fn assert_dollars(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("a priced total");
+
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected ${expected}, got ${actual}"
+        );
+    }
+
+    #[test]
+    fn repeated_content_block_lines_are_priced_once() {
+        let projects = scratch("daily-dedupe");
+        let now = format!("{TODAY}T10:00:00.000Z");
+        let one_million_out = output_only(1_000_000);
+
+        let block = usage_line("msg_a", &now, "claude-opus-5-5", one_million_out.clone());
+        let lines = vec![
+            block.clone(),
+            block.clone(),
+            block,
+            usage_line("msg_b", &now, "claude-opus-5-5", one_million_out.clone()),
+            usage_line(
+                "msg_c",
+                "2026-11-11T23:59:59.000Z",
+                "claude-opus-5-5",
+                one_million_out,
+            ),
+        ];
+        write_transcript(&projects.join("proj/session.jsonl"), &lines);
+
+        assert_dollars(sum_transcript_costs(&projects, TODAY, &None, None), 40.0);
+    }
+
+    #[test]
+    fn subagent_and_workflow_transcripts_are_counted() {
+        let projects = scratch("daily-nested");
+        let now = format!("{TODAY}T10:00:00.000Z");
+        let line = |id: &str| usage_line(id, &now, "claude-opus-5-5", output_only(1_000_000));
+
+        write_transcript(&projects.join("proj/session.jsonl"), &[line("msg_main")]);
+        write_transcript(
+            &projects.join("proj/session/subagents/agent-a1.jsonl"),
+            &[line("msg_agent")],
+        );
+        write_transcript(
+            &projects.join("proj/session/subagents/workflows/wf_1/agent-a2.jsonl"),
+            &[line("msg_workflow")],
+        );
+
+        assert_dollars(sum_transcript_costs(&projects, TODAY, &None, None), 60.0);
+    }
+
+    #[test]
+    fn specific_model_ids_win_over_family_catch_alls() {
+        let base = |model: &str| builtin_price(model).map(|price| price.base);
+
+        assert_eq!(base("claude-opus-5-5"), Some(rates(4.0, 20.0, 0.20)));
+        assert_eq!(base("claude-opus-4-8"), Some(rates(5.0, 25.0, 0.50)));
+        assert_eq!(base("claude-fable-5-1"), Some(rates(10.0, 50.0, 0.25)));
+        assert_eq!(base("claude-fable-5"), Some(rates(10.0, 50.0, 1.00)));
+        assert_eq!(base("claude-sonnet-5-5"), Some(rates(2.0, 10.0, 0.20)));
+        assert_eq!(base("claude-sonnet-4-6"), Some(rates(3.0, 15.0, 0.30)));
+        assert_eq!(base("claude-haiku-5-5"), Some(rates(0.10, 0.50, 0.01)));
+        assert_eq!(base("claude-haiku-4-5"), Some(rates(1.0, 5.0, 0.10)));
+        assert_eq!(base("<synthetic>"), None);
+    }
+
+    #[test]
+    fn cache_reads_are_priced_at_each_models_own_rate() {
+        let one_million_read = serde_json::json!({ "cache_read_input_tokens": 1_000_000 });
+        let cost = |model: &str| line_cost(&one_million_read, builtin_price(model).unwrap());
+
+        assert!((cost("claude-opus-5-5") - 0.20).abs() < 1e-9);
+        assert!((cost("claude-fable-5-1") - 0.25).abs() < 1e-9);
+        assert!((cost("claude-opus-4-8") - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_long_haiku_prompt_is_billed_at_the_long_prompt_rates() {
+        let haiku = builtin_price("claude-haiku-5-5").unwrap();
+        let input = |tokens: u64| serde_json::json!({ "input_tokens": tokens });
+
+        assert!((line_cost(&input(100_000), haiku) - 0.01).abs() < 1e-9);
+        assert!((line_cost(&input(150_000), haiku) - 0.075).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_override_without_a_cache_read_rate_reads_at_a_tenth_of_input() {
+        let overrides = Some(serde_json::json!({
+            "claude-custom": { "input": 2.0, "output": 8.0 },
+            "claude-tuned": { "input": 2.0, "output": 8.0, "cache_read": 0.05 },
+        }));
+        let read_rate = |model: &str| price_for(model, &overrides).unwrap().base.cache_read_per_m;
+
+        assert!((read_rate("claude-custom") - 0.20).abs() < 1e-9);
+        assert!((read_rate("claude-tuned") - 0.05).abs() < 1e-9);
     }
 }
